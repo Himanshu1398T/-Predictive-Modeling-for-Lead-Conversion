@@ -1,0 +1,426 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023-11-16"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(pscl)
+library(car)
+library(dplyr) 
+library(caret) 
+library(ROSE) 
+library(FSelector) 
+library(tidyverse)
+library(party)
+library(pROC)
+library(CustomerScoringMetrics)
+library(randomForest)
+library(data.table)
+library(mltools)
+library(ggplot2)
+library(reshape2)
+library(smotefamily)
+library(data.table)
+library(e1071)
+```
+
+```{r}
+# Load the dataset
+data <- read.csv("assignment_data.csv", stringsAsFactors = T)
+```
+
+```{r}
+# Display the structure and summary of the dataset
+str(data)
+summary(data)
+
+data$ID <- NULL
+data <- filter(data, Dependent != -1)
+# data_new <- data_new %>% mutate(across(c("Target", "Registration", "Dependent", "Marital_Status"), factor))
+
+data$Target <- factor(data$Target)
+```
+
+```{r}
+# Find the missing value
+complete_cases <- data[!is.na(data$Credit_Product), ]
+missing_cases <- data[is.na(data$Credit_Product), ]
+
+# Build the predict model
+model <- randomForest(Credit_Product ~ ., data = complete_cases)
+
+# Predict the missing value
+predicted_values <- predict(model, newdata = missing_cases)
+
+# Replace the missing value
+data$Credit_Product[is.na(data$Credit_Product)] <- predicted_values
+```
+
+```{r}
+# Coding the factors
+data$Gender <- recode(data$Gender, "Male" = 1, "Female" = 2)
+data$Occupation <- recode(data$Occupation, "Entrepreneur" = 1, "Other" = 2, "Salaried" = 3, "Self_Employed" = 4)
+data$Channel_Code <- recode(data$Channel_Code, "X1" = 1, "X2" = 2, "X3" = 3, "X4" = 4)
+data$Credit_Product <- recode(data$Credit_Product, "No" = 1, "Yes" = 2)
+data$Account_Type <- recode(data$Account_Type, "Gold" = 1, "Platinum" = 2, "Silver" = 3)
+data$Active <- recode(data$Active, "No" = 1, "Yes" = 2)
+```
+
+```{r}
+# Set seed
+set.seed(10)
+
+# Partition the dataset into training and test sets
+index = createDataPartition(data$Target, p = 0.7, list = FALSE)
+
+# Generate training and test data
+training = data[index, ]
+test = data[-index, ]
+
+# Apply oversampling technique
+bothsampled <- ovun.sample(Target ~. , data = training, method = "both", p=0.4)$data
+```
+
+
+```{r}
+# Compute information gain values of the attributes
+weights <- information.gain(Target~., bothsampled)
+weights
+```
+
+```{r}
+# Add row names as a column to keep them during ordering
+weights$attr <- rownames(weights)
+# Sort the weights in decreasing order of information gain values
+weights <- arrange(weights, -attr_importance)
+# Plot the weights
+barplot(weights$attr_importance, names = weights$attr, las = 2, ylim = c(0, 0.06), xlab = "Features", ylab = "Information Gain") 
+barplot(weights$attr_importance, names.arg = weights$attr, las = 2, ylim = c(0, 0.2), 
+        xlab = "Features", ylab = "Information Gain", mgp = c(4, 0.5, 0))
+
+barplot(weights$attr_importance, ylim = c(0, 0.2), xlab = "Features", ylab = "Information Gain",mgp = c(2, 0.5, 0)) + text(x = seq_along(weights$attr), y = rep(0, length(weights$attr)), labels = weights$attr, srt = 45, adj = c(1, 1), xpd = TRUE, cex = 0.8)
+
+```
+
+
+```{r}
+# Filter features with positive information gain
+features <- filter(weights, attr_importance > 0.0001)$attr
+
+# Select a subset of the dataset by using features
+datamodelling <- bothsampled[features]
+
+# Add target variable to the filtered dataset for modelling
+datamodelling$Target <- bothsampled$Target
+```
+
+
+```{r}
+library(C50)
+# Build the decision tree and save it as tree_model
+tree_model <- C5.0(Target ~., datamodelling)
+
+# Predicting the Test set results 
+tree_predict = predict(tree_model, test)
+
+# Compute the confusion matrix
+confusionMatrix(tree_predict, test$Target, positive='1', mode = "prec_recall")
+```
+
+
+```{r}
+# Build a decision tree
+DT_model <- ctree(Target~. , data = bothsampled)
+```
+
+```{r}
+# Predicting the Test set results 
+DT_predict = predict(DT_model, test)
+
+# Compute the confusion matrix
+confusionMatrix(DT_predict, test$Target, positive='1', mode = "prec_recall")
+```
+
+```{r}
+# Define the objective function for AUC-ROC
+objective_function_aucroc <- function(maxdepth, minsplit, minbucket) {
+  # Training ctree model
+  ctree_model <- ctree(Target ~ ., data = bothsampled,
+                       controls = ctree_control(maxdepth = maxdepth,
+                                                minsplit = minsplit,
+                                                minbucket = minbucket))
+  
+  # Predict the test set probabilities
+  ctree_probs <- sapply(best_ctree_prob, function(x) x[[2]])
+  
+  # Calculate AUC-ROC
+  aucroc <- pROC::auc(test$Target, ctree_probs)
+  
+  return(aucroc)
+}
+
+# Define the parameter grid
+param_grid <- expand.grid(
+  maxdepth = seq(1, 5, by = 1),    
+  minsplit = seq(2, 10, by = 2),   
+  minbucket = seq(1, 5, by = 1)   
+)
+
+# Initialize the best parameters and the best AUC-ROC
+best_params_aucroc <- NULL
+best_aucroc <- 0
+
+# Loop through parameter combinations
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+  aucroc <- objective_function_aucroc(params$maxdepth, params$minsplit, params$minbucket)
+  
+  # Update best parameters and best AUC-ROC
+  if (aucroc > best_aucroc) {
+    best_params_aucroc <- params
+    best_aucroc <- aucroc
+  }
+}
+
+# Output best AUC-ROC and best parameters
+cat("Best AUC-ROC:", best_aucroc, "\n")
+cat("Best Parameters:\n")
+print(best_params_aucroc)
+
+```
+
+
+```{r}
+# Training the ctree model using optimal parameters
+best_ctree_model <- ctree(Target ~ ., data = bothsampled,
+                          controls = ctree_control(maxdepth = 5,
+                                                   minsplit = 2,
+                                                   minbucket = 1))
+
+
+# Predict the test set
+best_ctree_predict <- predict(best_ctree_model, newdata = test)
+
+# Compute the confusion matrix
+confusionMatrix(best_ctree_predict, test$Target, positive='1', mode = "prec_recall")
+
+# print the model summary
+print(best_ctree_model)
+```
+
+
+```{r}
+# Obtain class probabilities
+best_ctree_prob <- predict(best_ctree_model, test, type = "prob")
+
+# Extract predicted probabilities for the positive class from each element of the list
+prob_positive <- sapply(best_ctree_prob, function(x) x[[2]])
+
+# Obtain the ROC curve data
+ROC_best_ctree <- roc(test$Target, prob_positive)
+
+#Calculate the area under the curve (AUC) for DT
+auc(ROC_best_ctree)
+```
+
+
+
+```{r}
+# Provide probabilities for the outcome of interest and obtain the gain chart data
+GainTable_best_ctree <- cumGainsTable(prob_positive, test$Target, resolution = 1/100)
+
+#Plot the gain chart
+plot(GainTable_best_ctree[,4], col="red", type="l", 
+xlab="Percentage of test instances", ylab="Percentage of identified invalid claims")
+```
+
+
+```{r}
+#Logistic regression applied to bothsampled data
+LR_model <- glm(Target ~ ., data = bothsampled, family = "binomial")
+summary(LR_model)
+
+# Assessing Model Fit
+pscl::pR2(LR_model)
+
+# Variable Importance
+caret::varImp(LR_model)
+
+# Calculate the VIF value to check the colinearity
+car::vif(LR_model)
+
+# Predict on the test set
+LR_predict <- predict(LR_model, newdata = test)
+# Predict the class
+LogReg_class <- ifelse(LR_predict > 0.5, 1, 0)
+# Save the predictions as factor variables
+LogReg_class <- as.factor(LogReg_class)
+
+# Compute the confusion matrix
+confusionMatrix(LogReg_class, test$Target, positive='1', mode = "prec_recall")
+```
+
+
+```{r}
+# Set the confusion matrix 
+confusionmatrixx <- matrix(c(52882, 3340, 3775, 5967), nrow = 2, byrow = TRUE)
+colnames(confusionmatrixx) <- c("Predicted: No", "Predicted: Yes")
+rownames(confusionmatrixx) <- c("Actual: No", "Actual: Yes")
+
+# Melt the data for ggplot
+confusionmatrixx_melted <- melt(confusionmatrixx)
+
+# Plotting the heatmap
+ggplot(confusionmatrixx_melted, aes(x = Var2, y = Var1, fill = value)) + 
+    geom_tile() +
+    geom_text(aes(label = value), vjust = 1) +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    theme_minimal()
+```
+
+
+```{r}
+# Obtain the ROC curve
+roc_curve <- roc(test$Target, test$predicted_prob)
+auc(roc_curve)
+
+# Plot the ROC curve
+pROC::ggroc(list(DT = ROC_best_ctree, LR = roc_curve), legacy.axes=TRUE)+ xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, color = "darkgrey", linetype = "dashed")
+```
+
+```{r}
+# Run SVM model
+svm_model  <- svm(Target ~. , data =  bothsampled, kernel = "radial", scale = TRUE, probability = TRUE)
+print(svm_model)
+
+# Predict on the test set
+svm_predict = predict(svm_model, test)
+
+# Compute the confusion matrix
+confusionMatrix(svm_predict, test$Target, positive='1', mode = "prec_recall")
+
+# Obtain class probabilities
+SVMpred <- predict(svm_model, test, probability = TRUE)
+
+# Extract predicted probabilities for the positive class from each element of the list
+prob_SVM <- attr(SVMpred, "probabilities")
+
+# Plot the ROC curve
+ROC_SVM <- roc(test$Target, prob_SVM[,2])
+
+auc(ROC_SVM)
+```
+
+
+```{r}
+# Build Random Forest model and assign it to RF_model
+RF_model <- randomForest(Target ~ ., bothsampled)
+
+print(RF_model)
+
+# Predict the class of the test data
+RF_pred <- predict(RF_model, test)
+
+# Confusion matrix
+confusionMatrix(RF_pred, test$Target, positive='1', mode = "prec_recall")
+
+RF_prob <- predict(RF_model, test, type = "prob")
+ROC_RF <- roc(test$Target, RF_prob[,2])
+
+```
+
+```{r}
+# Perform joint hyperparameter tuning using tune function
+tuned_rf <- randomForestSRC::tune(Target~., bothsampled,
+                 mtryStart = sqrt(ncol(bothsampled)),
+                 nodesizeTry = seq(1, 10, by = 2),
+                 ntree = 500,
+                 stepFactor = 1.25, improve = 0.001)
+
+# View the results to see the best hyperparameters
+tuned_rf$optimal
+
+```
+
+```{r}
+# Random Forest after tuning
+bestRF <-  randomForest(Target~., bothsampled, mtry = 8, nodesize = 1)
+
+RF_tunedpred <- predict(bestRF, test)
+
+confusionMatrix(RF_tunedpred, test$Target, positive='1', mode = "prec_recall")
+
+ROC_bestRF <- roc(test$Target, RF_tunedpred[,2])
+```
+
+```{r}
+# Make a undersampling training set
+index = createDataPartition(data$Target, p = 0.7, list = FALSE)
+training = data[index, ]
+test = data[-index, ]
+
+undersampled <- ovun.sample(Target ~. , data = training, method = "under", p=0.4)$data
+table(undersampled$Target)
+```
+
+```{r}
+# Random Forest model with K-Folds Cross-Validation
+
+train_control <- trainControl(method = "cv", number = 5) 
+model <- train(Target ~ ., data = undersampled, method = "rf", trControl = train_control)
+
+model_predict = predict(model, test)
+
+results <- test
+results$Prediction <-  model_predict
+correct <- which(test$Target == model_predict )
+accuracy <- length(correct)/nrow(test)
+
+confusionMatrix(model_predict, test$Target, positive='1', mode = "prec_recall")
+
+RF_prob <- predict(model, test, type = "prob")
+ROC_RF <- roc(test$Target, RF_prob[,2])
+
+
+auc(ROC_RF)
+
+```
+
+```{r}
+pROC::ggroc(list(SVM = ROC_SVM, RF = ROC_bestRF, DT = ROC_best_ctree, LogReg = roc_curve), legacy.axes=TRUE)+ xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, color = "darkgrey", linetype = "dashed")
+```
+
+
+```{r}
+library(CustomerScoringMetrics)
+
+# Provide probabilities for the outcome of interest and obtain the gain chart data
+GainTable_LogReg <- cumGainsTable(LR_predict, test$Target, resolution = 1/100)
+
+GainTable_SVM <- cumGainsTable(svm_predict, test$Target, resolution = 1/100)
+
+GainTable_RF <- cumGainsTable(RF_tunedpred[,2], test$Target, resolution = 1/100)
+
+GainTable_DT <- cumGainsTable(prob_positive, test$Target, resolution = 1/100)
+
+plot(GainTable_LogReg[,4], col="red", type="l",    
+xlab="Percentage of test instances", ylab="Percentage of identified invalid claims")
+lines(GainTable_RF[,4], col="green", type ="l")
+lines(GainTable_SVM[,4], col="blue", type ="l")
+lines(GainTable_DT[,4], col="yellow", type ="l")
+grid(NULL, lwd = 1)
+
+legend("bottomright",
+c("LogReg", "SVM", "Random Forest","Decision Tree"),
+fill=c("red","blue", "green","yellow"))
+```
+
